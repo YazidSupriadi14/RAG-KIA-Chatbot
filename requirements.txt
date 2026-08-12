@@ -1,6 +1,6 @@
-spaces>=0.30.0
-transformers>=4.44.0
-accelerate>=0.33.0
+streamlit>=1.38.0
 sentence-transformers>=3.0.0
 faiss-cpu>=1.8.0
+llama-cpp-python>=0.2.90
+huggingface_hub>=0.24.0
 numpy<2.0

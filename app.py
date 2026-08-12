@@ -1,36 +1,33 @@
 """
-RAG Buku KIA — versi ZeroGPU untuk Hugging Face Spaces.
+RAG Buku KIA — versi Streamlit untuk Streamlit Community Cloud.
 
-ZeroGPU cuma minjemin GPU pas fungsi yang didekorasi @spaces.GPU dipanggil — jadi
-model di-load sekali di awal (di luar fungsi), tapi actual inference (model.generate)
-dibungkus @spaces.GPU supaya dapat akses GPU cuma pas dibutuhkan.
+Backend (retrieval + generation) identik dengan versi CPU/GGUF sebelumnya:
+FAISS + sentence-transformers untuk retrieval, llama-cpp-python (GGUF) untuk generation.
+Cuma lapisan UI-nya yang diganti dari Gradio ke Streamlit.
 
-PENTING:
-- Space SDK harus Gradio (ZeroGPU cuma kompatibel dengan Gradio SDK).
-- Space hardware di Settings harus dipilih "ZeroGPU".
-- Kuota GPU harian terbatas untuk akun gratis — kalau habis, request generation akan
-  gagal/ditolak sampai kuota reset (~24 jam). Kalau butuh lebih banyak, pertimbangkan
-  HF PRO ($9/bulan, 8x kuota) atau turunkan `duration` di decorator @spaces.GPU.
-
-Struktur folder Space yang dibutuhkan:
-    app.py                  <- file ini
+Struktur folder repo GitHub yang dibutuhkan (Streamlit Cloud connect langsung ke GitHub):
+    streamlit_app.py        <- file ini (atau app.py, sesuaikan saat setup di Streamlit Cloud)
     requirements.txt
     data/
-        chunks.json         <- hasil dari notebook (Step 4b)
-        faiss_index.bin     <- hasil dari notebook (Step 6)
-"""
+        chunks.json          <- hasil dari notebook (Step 4b)
+        faiss_index.bin      <- hasil dari notebook (Step 6)
 
-import spaces  # HARUS import paling pertama, sebelum torch/transformers/faiss/dll,
-                # supaya CUDA belum ke-init duluan sebelum spaces masang patch-nya
+Cara deploy:
+1. Push semua file di atas ke repo GitHub (public atau private).
+2. Buka share.streamlit.io, login pakai GitHub, klik "New app".
+3. Pilih repo, branch, dan file ini sebagai main file.
+4. Deploy — boot pertama agak lama (download model GGUF ~2GB).
+"""
 
 import json
 import os
 
 import faiss
-import gradio as gr
-import torch
+import numpy as np
+import streamlit as st
+from huggingface_hub import hf_hub_download
+from llama_cpp import Llama
 from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # ---------------------------------------------------------------------------
 # Konfigurasi
@@ -38,14 +35,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 ARTIFACT_DIR = "./data"
 EMBED_MODEL_NAME = "intfloat/multilingual-e5-base"
 
-# Dengan ZeroGPU (VRAM besar), model 7B nyaman dipakai. Kalau mau lebih hemat kuota
-# (generation lebih cepat = durasi @spaces.GPU lebih pendek = kuota harian lebih awet),
-# turunkan ke 'Qwen/Qwen2.5-3B-Instruct'.
-GEN_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+GGUF_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"
+GGUF_FILENAME = "qwen2.5-3b-instruct-q4_k_m.gguf"  # cek nama persis di halaman HF repo-nya
 
 MAX_CHARS_PER_CHUNK = 600
 TOP_K = 5
-GPU_DURATION = 60  # detik maksimal per pemanggilan @spaces.GPU; naikkan kalau sering timeout
+N_CTX = 4096
 
 SYSTEM_PROMPT = """Kamu adalah asisten informasi kesehatan ibu hamil, bersalin, dan menyusui
 berdasarkan Buku KIA (Kemenkes RI).
@@ -68,29 +63,34 @@ EXAMPLE_QUESTIONS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Load artifacts & model (sekali saja saat Space start)
+# Load artifacts & model — pakai st.cache_resource biar cuma jalan SEKALI,
+# bukan tiap kali ada interaksi (ini poin penting yang sempat dibahas soal
+# risiko Streamlit reload berulang kalau lupa caching)
 # ---------------------------------------------------------------------------
-print("Memuat chunks...")
-with open(os.path.join(ARTIFACT_DIR, "chunks.json"), "r", encoding="utf-8") as f:
-    all_chunks = json.load(f)
+@st.cache_resource(show_spinner="Memuat data & model (cuma sekali di awal)...")
+def load_pipeline():
+    with open(os.path.join(ARTIFACT_DIR, "chunks.json"), "r", encoding="utf-8") as f:
+        chunks = json.load(f)
 
-print("Memuat FAISS index...")
-index = faiss.read_index(os.path.join(ARTIFACT_DIR, "faiss_index.bin"))
+    idx = faiss.read_index(os.path.join(ARTIFACT_DIR, "faiss_index.bin"))
+    embed = SentenceTransformer(EMBED_MODEL_NAME, device="cpu")
 
-print("Memuat model embedding (CPU, gak butuh ZeroGPU)...")
-embed_model = SentenceTransformer(EMBED_MODEL_NAME, device="cpu")
+    gguf_path = hf_hub_download(repo_id=GGUF_REPO, filename=GGUF_FILENAME)
+    llm = Llama(
+        model_path=gguf_path,
+        n_ctx=N_CTX,
+        n_threads=os.cpu_count() or 2,
+        chat_format="chatml",
+        verbose=False,
+    )
+    return chunks, idx, embed, llm
 
-print(f"Memuat model generation ({GEN_MODEL_NAME}), fp16 tanpa quantization...")
-gen_tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME)
-gen_model = AutoModelForCausalLM.from_pretrained(
-    GEN_MODEL_NAME,
-    torch_dtype=torch.float16,
-).to("cuda")
-print("Model siap.")
+
+all_chunks, index, embed_model, llm = load_pipeline()
 
 
 # ---------------------------------------------------------------------------
-# Retrieval (jalan di CPU, gak perlu ZeroGPU — cepat untuk skala chunk kita)
+# Retrieval & Generation
 # ---------------------------------------------------------------------------
 def keyword_boost(query, chunk_text, chunk_label=None):
     query_words = set(w.lower() for w in query.split() if len(w) > 3)
@@ -116,11 +116,7 @@ def retrieve(query, top_k=TOP_K, initial_k=15):
     return candidates[:top_k]
 
 
-# ---------------------------------------------------------------------------
-# Generation — INI yang butuh GPU, jadi didekorasi @spaces.GPU
-# ---------------------------------------------------------------------------
-@spaces.GPU(duration=GPU_DURATION)
-def generate_answer(query, retrieved_chunks, max_new_tokens=800):
+def generate_answer(query, retrieved_chunks, max_tokens=800):
     context = "\n\n".join(
         f"[{c['section_title']} - p.{c['pdf_page']}] {c['text'][:MAX_CHARS_PER_CHUNK]}"
         for c in retrieved_chunks
@@ -137,33 +133,17 @@ def generate_answer(query, retrieved_chunks, max_new_tokens=800):
         {"role": "system", "content": SYSTEM_PROMPT + danger_note},
         {"role": "user", "content": f"Konteks:\n{context}\n\nPertanyaan: {query}"},
     ]
-    prompt = gen_tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+
+    result = llm.create_chat_completion(
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=0.3,
+        repeat_penalty=1.1,
     )
-    inputs = gen_tokenizer(prompt, return_tensors="pt").to(gen_model.device)
-
-    with torch.no_grad():
-        output_ids = gen_model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=0.3,
-            do_sample=True,
-            repetition_penalty=1.1,
-            pad_token_id=gen_tokenizer.eos_token_id,
-        )
-
-    generated = output_ids[0][inputs["input_ids"].shape[1] :]
-    answer = gen_tokenizer.decode(generated, skip_special_tokens=True).strip()
-
-    del inputs, output_ids, generated
-    torch.cuda.empty_cache()
-
+    answer = result["choices"][0]["message"]["content"].strip()
     return answer, has_danger
 
 
-# ---------------------------------------------------------------------------
-# UI helpers & chat function
-# ---------------------------------------------------------------------------
 def format_sources(retrieved_chunks):
     seen = []
     for c in retrieved_chunks:
@@ -173,19 +153,17 @@ def format_sources(retrieved_chunks):
     return seen
 
 
-def chat_fn(message, history):
-    retrieved = retrieve(message)
-    answer, has_danger = generate_answer(message, retrieved)
+def answer_question(query):
+    retrieved = retrieve(query)
+    answer, has_danger = generate_answer(query, retrieved)
     sources = format_sources(retrieved)
 
     parts = [answer.strip()]
-
     if has_danger:
         parts.append(
             "\n\n> \u26a0\ufe0f **Kalau ini kondisi darurat, segera hubungi bidan/dokter "
             "atau ke fasilitas kesehatan terdekat.**"
         )
-
     if sources:
         sources_text = "  \n".join(f"\U0001F4C4 *{s}*" for s in sources)
         parts.append(f"\n\n---\n**Sumber:**  \n{sources_text}")
@@ -194,56 +172,68 @@ def chat_fn(message, history):
 
 
 # ---------------------------------------------------------------------------
-# Tema & layout
+# UI — Streamlit
 # ---------------------------------------------------------------------------
-theme = gr.themes.Soft(
-    primary_hue=gr.themes.colors.pink,
-    secondary_hue=gr.themes.colors.emerald,
-    neutral_hue=gr.themes.colors.slate,
-    font=[gr.themes.GoogleFont("Poppins"), "sans-serif"],
-).set(
-    button_primary_background_fill="*primary_500",
-    button_primary_background_fill_hover="*primary_600",
-    block_radius="16px",
-    block_shadow="0 2px 12px rgba(0,0,0,0.06)",
+st.set_page_config(page_title="RAG Buku KIA", page_icon="\U0001F931", layout="centered")
+
+st.markdown(
+    """
+    <style>
+    .header-box {
+        background: linear-gradient(135deg, #fbcfe8 0%, #a7f3d0 100%);
+        border-radius: 20px;
+        padding: 24px 28px;
+        margin-bottom: 20px;
+    }
+    .header-box h1 { margin: 0 0 4px 0; font-size: 26px; color: #831843; }
+    .header-box p { margin: 0; color: #065f46; font-size: 14px; }
+    .disclaimer { font-size: 12px; color: #64748b; text-align: center; margin-top: 16px; }
+    </style>
+    <div class="header-box">
+        <h1>\U0001F931 Tanya Buku KIA</h1>
+        <p>Asisten seputar kehamilan, persalinan, dan menyusui \u2014 berdasarkan
+        Buku Kesehatan Ibu dan Anak (Kemenkes RI). Bukan pengganti konsultasi medis.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
-CUSTOM_CSS = """
-#header-box {
-    background: linear-gradient(135deg, #fbcfe8 0%, #a7f3d0 100%);
-    border-radius: 20px;
-    padding: 24px 28px;
-    margin-bottom: 12px;
-}
-#header-box h1 { margin: 0 0 4px 0; font-size: 26px; color: #831843; }
-#header-box p { margin: 0; color: #065f46; font-size: 14px; }
-#disclaimer { font-size: 12px; color: #64748b; text-align: center; margin-top: 8px; }
-"""
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-with gr.Blocks(title="RAG Buku KIA") as demo:
-    gr.HTML(
-        """
-        <div id="header-box">
-            <h1>\U0001F931 Tanya Buku KIA</h1>
-            <p>Asisten seputar kehamilan, persalinan, dan menyusui \u2014 berdasarkan
-            Buku Kesehatan Ibu dan Anak (Kemenkes RI). Bukan pengganti konsultasi medis.</p>
-        </div>
-        """
-    )
+# Contoh pertanyaan (cuma tampil kalau belum ada percakapan)
+if not st.session_state.messages:
+    st.markdown("**\U0001F4A1 Contoh pertanyaan:**")
+    cols = st.columns(1)
+    for q in EXAMPLE_QUESTIONS:
+        if st.button(q, use_container_width=True):
+            st.session_state.messages.append({"role": "user", "content": q})
+            with st.spinner("Mencari jawaban..."):
+                answer = answer_question(q)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.rerun()
 
-    gr.ChatInterface(
-        fn=chat_fn,
-        examples=EXAMPLE_QUESTIONS,
-        chatbot=gr.Chatbot(height=480, avatar_images=(None, "\U0001F931")),
-        textbox=gr.Textbox(
-            placeholder="Tulis pertanyaan seputar kehamilan, persalinan, atau menyusui..."
-        ),
-    )
+# Tampilkan riwayat chat
+for msg in st.session_state.messages:
+    avatar = "\U0001F931" if msg["role"] == "assistant" else None
+    with st.chat_message(msg["role"], avatar=avatar):
+        st.markdown(msg["content"])
 
-    gr.HTML(
-        '<div id="disclaimer">\u2695\ufe0f Informasi ini bersifat umum dan tidak menggantikan '
-        "pemeriksaan langsung oleh tenaga kesehatan.</div>"
-    )
+# Input pertanyaan baru
+if prompt := st.chat_input("Tulis pertanyaan seputar kehamilan, persalinan, atau menyusui..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-if __name__ == "__main__":
-    demo.launch(theme=theme, css=CUSTOM_CSS)
+    with st.chat_message("assistant", avatar="\U0001F931"):
+        with st.spinner("Mencari jawaban..."):
+            answer = answer_question(prompt)
+        st.markdown(answer)
+
+    st.session_state.messages.append({"role": "assistant", "content": answer})
+
+st.markdown(
+    '<div class="disclaimer">\u2695\ufe0f Informasi ini bersifat umum dan tidak menggantikan '
+    "pemeriksaan langsung oleh tenaga kesehatan.</div>",
+    unsafe_allow_html=True,
+)
