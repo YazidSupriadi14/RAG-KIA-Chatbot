@@ -20,12 +20,14 @@ Struktur folder Space yang dibutuhkan:
         faiss_index.bin     <- hasil dari notebook (Step 6)
 """
 
+import spaces  # HARUS import paling pertama, sebelum torch/transformers/faiss/dll,
+                # supaya CUDA belum ke-init duluan sebelum spaces masang patch-nya
+
 import json
 import os
 
 import faiss
 import gradio as gr
-import spaces
 import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -88,7 +90,7 @@ gen_tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME)
 gen_model = AutoModelForCausalLM.from_pretrained(
     GEN_MODEL_NAME,
     quantization_config=bnb_config,
-    device_map="auto",
+    device_map={"": 0},  # eksplisit ke GPU index 0, lebih kompatibel dgn ZeroGPU dibanding 'auto'
 )
 print("Model siap.")
 
