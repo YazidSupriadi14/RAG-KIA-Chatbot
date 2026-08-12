@@ -30,7 +30,7 @@ import faiss
 import gradio as gr
 import torch
 from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # ---------------------------------------------------------------------------
 # Konfigurasi
@@ -80,18 +80,12 @@ index = faiss.read_index(os.path.join(ARTIFACT_DIR, "faiss_index.bin"))
 print("Memuat model embedding (CPU, gak butuh ZeroGPU)...")
 embed_model = SentenceTransformer(EMBED_MODEL_NAME, device="cpu")
 
-print(f"Memuat model generation ({GEN_MODEL_NAME})...")
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-)
+print(f"Memuat model generation ({GEN_MODEL_NAME}), fp16 tanpa quantization...")
 gen_tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME)
 gen_model = AutoModelForCausalLM.from_pretrained(
     GEN_MODEL_NAME,
-    quantization_config=bnb_config,
-    device_map={"": 0},  # eksplisit ke GPU index 0, lebih kompatibel dgn ZeroGPU dibanding 'auto'
-)
+    torch_dtype=torch.float16,
+).to("cuda")
 print("Model siap.")
 
 
