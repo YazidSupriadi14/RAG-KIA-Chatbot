@@ -1,6 +1,9 @@
 gradio>=4.44.0
+spaces
+transformers>=4.44.0
+accelerate>=0.33.0
+bitsandbytes>=0.43.0
+torch
 sentence-transformers>=3.0.0
 faiss-cpu>=1.8.0
-llama-cpp-python>=0.2.90
-huggingface_hub>=0.24.0
 numpy<2.0

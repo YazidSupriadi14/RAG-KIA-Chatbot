@@ -1,10 +1,16 @@
 """
-RAG Buku KIA — versi CPU (GGUF via llama-cpp-python) untuk Hugging Face Spaces gratis.
+RAG Buku KIA — versi ZeroGPU untuk Hugging Face Spaces.
 
-Beda dari versi Colab (yang pakai transformers + bitsandbytes 4-bit, butuh GPU):
-versi ini pakai model GGUF yang di-quantize khusus untuk jalan di CPU lewat llama-cpp-python.
-Embedding & retrieval tetap sama persis (FAISS + sentence-transformers, sudah CPU-friendly
-dari awal).
+ZeroGPU cuma minjemin GPU pas fungsi yang didekorasi @spaces.GPU dipanggil — jadi
+model di-load sekali di awal (di luar fungsi), tapi actual inference (model.generate)
+dibungkus @spaces.GPU supaya dapat akses GPU cuma pas dibutuhkan.
+
+PENTING:
+- Space SDK harus Gradio (ZeroGPU cuma kompatibel dengan Gradio SDK).
+- Space hardware di Settings harus dipilih "ZeroGPU".
+- Kuota GPU harian terbatas untuk akun gratis — kalau habis, request generation akan
+  gagal/ditolak sampai kuota reset (~24 jam). Kalau butuh lebih banyak, pertimbangkan
+  HF PRO ($9/bulan, 8x kuota) atau turunkan `duration` di decorator @spaces.GPU.
 
 Struktur folder Space yang dibutuhkan:
     app.py                  <- file ini
@@ -12,9 +18,6 @@ Struktur folder Space yang dibutuhkan:
     data/
         chunks.json         <- hasil dari notebook (Step 4b)
         faiss_index.bin     <- hasil dari notebook (Step 6)
-
-Model GGUF di-download otomatis saat Space start (jangan commit file .gguf-nya sendiri ke
-repo, biar Space-nya tetap ringan — cache HF yang nanganin).
 """
 
 import json
@@ -22,10 +25,10 @@ import os
 
 import faiss
 import gradio as gr
-import numpy as np
-from huggingface_hub import hf_hub_download
-from llama_cpp import Llama
+import spaces
+import torch
 from sentence_transformers import SentenceTransformer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # ---------------------------------------------------------------------------
 # Konfigurasi
@@ -33,15 +36,14 @@ from sentence_transformers import SentenceTransformer
 ARTIFACT_DIR = "./data"
 EMBED_MODEL_NAME = "intfloat/multilingual-e5-base"
 
-# Model GGUF — cek dulu nama file persis di halaman HF repo-nya (bisa beda-beda
-# tergantung siapa yang upload). Q4_K_M adalah titik seimbang antara ukuran & kualitas.
-GGUF_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"
-GGUF_FILENAME = "qwen2.5-3b-instruct-q4_k_m.gguf"
+# Dengan ZeroGPU (VRAM besar), model 7B nyaman dipakai. Kalau mau lebih hemat kuota
+# (generation lebih cepat = durasi @spaces.GPU lebih pendek = kuota harian lebih awet),
+# turunkan ke 'Qwen/Qwen2.5-3B-Instruct'.
+GEN_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 
 MAX_CHARS_PER_CHUNK = 600
 TOP_K = 5
-N_CTX = 4096  # ukuran context window; turunkan kalau RAM Space kamu terbatas
-N_THREADS = os.cpu_count() or 2
+GPU_DURATION = 60  # detik maksimal per pemanggilan @spaces.GPU; naikkan kalau sering timeout
 
 SYSTEM_PROMPT = """Kamu adalah asisten informasi kesehatan ibu hamil, bersalin, dan menyusui
 berdasarkan Buku KIA (Kemenkes RI).
@@ -64,7 +66,7 @@ EXAMPLE_QUESTIONS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Load artifacts (sekali saja saat Space start)
+# Load artifacts & model (sekali saja saat Space start)
 # ---------------------------------------------------------------------------
 print("Memuat chunks...")
 with open(os.path.join(ARTIFACT_DIR, "chunks.json"), "r", encoding="utf-8") as f:
@@ -73,23 +75,26 @@ with open(os.path.join(ARTIFACT_DIR, "chunks.json"), "r", encoding="utf-8") as f
 print("Memuat FAISS index...")
 index = faiss.read_index(os.path.join(ARTIFACT_DIR, "faiss_index.bin"))
 
-print("Memuat model embedding (CPU)...")
+print("Memuat model embedding (CPU, gak butuh ZeroGPU)...")
 embed_model = SentenceTransformer(EMBED_MODEL_NAME, device="cpu")
 
-print(f"Mengunduh & memuat model GGUF ({GGUF_REPO}/{GGUF_FILENAME})...")
-gguf_path = hf_hub_download(repo_id=GGUF_REPO, filename=GGUF_FILENAME)
-llm = Llama(
-    model_path=gguf_path,
-    n_ctx=N_CTX,
-    n_threads=N_THREADS,
-    chat_format="chatml",  # Qwen2.5 pakai format ChatML
-    verbose=False,
+print(f"Memuat model generation ({GEN_MODEL_NAME})...")
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
 )
-print("Model siap. n_threads:", N_THREADS)
+gen_tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME)
+gen_model = AutoModelForCausalLM.from_pretrained(
+    GEN_MODEL_NAME,
+    quantization_config=bnb_config,
+    device_map="auto",
+)
+print("Model siap.")
 
 
 # ---------------------------------------------------------------------------
-# Retrieval (identik dengan versi Colab)
+# Retrieval (jalan di CPU, gak perlu ZeroGPU — cepat untuk skala chunk kita)
 # ---------------------------------------------------------------------------
 def keyword_boost(query, chunk_text, chunk_label=None):
     query_words = set(w.lower() for w in query.split() if len(w) > 3)
@@ -116,9 +121,10 @@ def retrieve(query, top_k=TOP_K, initial_k=15):
 
 
 # ---------------------------------------------------------------------------
-# Generation (GGUF via llama-cpp-python, bukan transformers lagi)
+# Generation — INI yang butuh GPU, jadi didekorasi @spaces.GPU
 # ---------------------------------------------------------------------------
-def generate_answer(query, retrieved_chunks, max_tokens=800):
+@spaces.GPU(duration=GPU_DURATION)
+def generate_answer(query, retrieved_chunks, max_new_tokens=800):
     context = "\n\n".join(
         f"[{c['section_title']} - p.{c['pdf_page']}] {c['text'][:MAX_CHARS_PER_CHUNK]}"
         for c in retrieved_chunks
@@ -135,14 +141,27 @@ def generate_answer(query, retrieved_chunks, max_tokens=800):
         {"role": "system", "content": SYSTEM_PROMPT + danger_note},
         {"role": "user", "content": f"Konteks:\n{context}\n\nPertanyaan: {query}"},
     ]
-
-    result = llm.create_chat_completion(
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=0.3,
-        repeat_penalty=1.1,
+    prompt = gen_tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
-    answer = result["choices"][0]["message"]["content"].strip()
+    inputs = gen_tokenizer(prompt, return_tensors="pt").to(gen_model.device)
+
+    with torch.no_grad():
+        output_ids = gen_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=0.3,
+            do_sample=True,
+            repetition_penalty=1.1,
+            pad_token_id=gen_tokenizer.eos_token_id,
+        )
+
+    generated = output_ids[0][inputs["input_ids"].shape[1] :]
+    answer = gen_tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+    del inputs, output_ids, generated
+    torch.cuda.empty_cache()
+
     return answer, has_danger
 
 
