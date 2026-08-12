@@ -226,7 +226,7 @@ CUSTOM_CSS = """
 #disclaimer { font-size: 12px; color: #64748b; text-align: center; margin-top: 8px; }
 """
 
-with gr.Blocks(theme=theme, css=CUSTOM_CSS, title="RAG Buku KIA") as demo:
+with gr.Blocks(title="RAG Buku KIA") as demo:
     gr.HTML(
         """
         <div id="header-box">
@@ -252,4 +252,4 @@ with gr.Blocks(theme=theme, css=CUSTOM_CSS, title="RAG Buku KIA") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(theme=theme, css=CUSTOM_CSS)

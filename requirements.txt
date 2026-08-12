@@ -1,9 +1,7 @@
-gradio==5.31.0
 spaces>=0.30.0
 transformers>=4.44.0
 accelerate>=0.33.0
 bitsandbytes>=0.43.0
-torch
 sentence-transformers>=3.0.0
 faiss-cpu>=1.8.0
 numpy<2.0
